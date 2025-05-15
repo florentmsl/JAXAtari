@@ -6,6 +6,7 @@ from jaxatari.games.jax_pong import JaxPong, PongRenderer
 from jaxatari.games.jax_seaquest import JaxSeaquest, SeaquestRenderer
 from jaxatari.games.jax_kangaroo import JaxKangaroo, KangarooRenderer
 from jaxatari.games.jax_freeway import JaxFreeway, FreewayRenderer
+from jaxatari.games.jax_sir_lancelot import JaxSirLancelot, SirLancelotRenderer
 
 class JAXAtari:
     def __init__(self, game_name):
@@ -23,6 +24,9 @@ class JAXAtari:
             case "freeway":
                 env = JaxFreeway()
                 renderer = FreewayRenderer()
+            case "sir_lancelot":
+                env = JaxSirLancelot()
+                renderer = SirLancelotRenderer()
             case _:
                 raise NotImplementedError(f"The game {game_name} does not exist")
         self.env: JaxEnvironment = env

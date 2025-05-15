@@ -5,7 +5,7 @@ from typing import NamedTuple, Tuple, List, Dict, Any, Optional
 import jax
 import jax.numpy as jnp
 import chex
-import pygame
+# import pygame # Only for demo loop, not core env
 
 from jaxatari.environment import JaxEnvironment, JAXAtariAction as Action
 import jaxatari.rendering.atraJaxis as aj
@@ -17,32 +17,50 @@ from jaxatari.renderers import AtraJaxisRenderer
 
 class GameConfig(NamedTuple):
     screen_width: int = 160
-    screen_height: int = 210
+    screen_height: int = 210 
 
-    # Player (Sir Lancelot)
+    top_black_bar_height: int = 24 
+    play_area_top_y: int = top_black_bar_height 
+    play_area_bottom_y: int = 184 
+    lava_contact_y: int = play_area_bottom_y + 2
+
     player_width: int = 9
     player_height: int = 14
-    player_start_x: int = 20
-    player_start_y: int = 120  # roughly mid‑screen
+    player_start_x: int = 75 
+    player_start_y: int = 130 
 
-    # Physics
-    gravity: float = 0.5        # pixels / frame² pulling downwards
-    flap_impulse: float = -4.0  # vertical impulse when FIRE is pressed
-    max_fall_speed: float = 3.0 # terminal velocity
-    max_speed_x: int = 2        # horizontal speed in pixels/frame
+    gravity: float = 0.22                  
+    flap_impulse: float = -2.8          
+    max_fall_speed: float = 2.8     
+    max_climb_speed: float = -2.8          
+    max_speed_x: float = 1.5 # Max horizontal speed WHEN FLYING
+    max_speed_x_grounded: float = 0.5 # Much slower when "walking" if allowed at all
+    horizontal_acceleration: float = 0.3   
+    horizontal_deceleration: float = 0.4
+    ground_friction_deceleration: float = 0.9 # Stronger deceleration on ground   
 
-    # Enemies (Flying Snakes – first level)
     enemy_width: int = 9
     enemy_height: int = 12
-    enemy_speed: int = 1        # horizontal speed
-    enemy_spawn_y_positions: Tuple[int, ...] = (60, 90, 120, 150)
-    enemy_spawn_x_left: int = -10
-    enemy_spawn_x_right: int = 170
+    enemy_speed: float = 0.85 
+    enemy_spawn_y_positions: chex.Array = jnp.array((40, 70, 100, 130), dtype=jnp.float32)
+    enemy_spawn_x_buffer: int = 20 
+    enemy_respawn_delay_frames: int = 120 
 
-    # Scoring / lives
     initial_lives: int = 3
     points_per_enemy: int = 250
+    quick_kill_bonus_1: int = 500  
+    quick_kill_bonus_2: int = 1000
+    quick_kill_bonus_3: int = 1500 
+    quick_kill_time_limit: int = 75 
 
+    flap_animation_duration: int = 8 
+    flap_cooldown_duration: int = 10 
+    death_cooldown_frames: int = 90 
+
+    hud_y_position: int = 8 
+    score_x_start: int = 50 
+    lives_x_start: int = 10
+    digit_sprite_width: int = 8
 
 # -----------------------------------------------------------------------------
 # STATE REPRESENTATIONS
@@ -51,287 +69,480 @@ class GameConfig(NamedTuple):
 class PlayerState(NamedTuple):
     x: chex.Array
     y: chex.Array
+    vel_x: chex.Array
     vel_y: chex.Array
-    facing_left: chex.Array  # Boolean – determines sprite & collision outcome
-    flap_cooldown: chex.Array  # simple debounce so holding FIRE doesn’t spam
+    facing_left: chex.Array 
+    flap_cooldown: chex.Array
+    is_flapping_sprite: chex.Array
+    flap_animation_timer: chex.Array
+    is_dead_falling: chex.Array 
+    death_cooldown: chex.Array
+    is_grounded: chex.Array # New state to track if player is on the ground
 
 class EnemyState(NamedTuple):
-    positions: chex.Array  # shape (N, 2) – x, y
-    directions: chex.Array  # shape (N,) – -1 == moving left → right? we’ll encode -1|1
-    active: chex.Array       # shape (N,) – whether the slot is currently on‑screen
-    animation_counter: chex.Array  # used to switch sprite frames
+    positions: chex.Array 
+    directions: chex.Array 
+    active: chex.Array 
+    animation_counter: chex.Array 
+    respawn_cooldown: chex.Array
 
 class GameState(NamedTuple):
     player: PlayerState
     enemies: EnemyState
     score: chex.Array
     lives: chex.Array
-    time: chex.Array   # frame counter (0‑based)
+    time: chex.Array
     game_over: chex.Array
+    last_kill_time: chex.Array
+    kills_in_quick_succession: chex.Array
+    key: jax.random.PRNGKey
+
 
 # -----------------------------------------------------------------------------
-# OBSERVATION / INFO (for RL agents or debugging  – minimal for now)
+# OBSERVATION / INFO
 # -----------------------------------------------------------------------------
 
-class EntityPosition(NamedTuple):
+class EntityPosition(NamedTuple): 
     x: jnp.ndarray
     y: jnp.ndarray
     width: jnp.ndarray
     height: jnp.ndarray
+    facing_left: Optional[jnp.ndarray] = None
 
 class SirLancelotObservation(NamedTuple):
     player: EntityPosition
-    enemies: jnp.ndarray  # (N,4)
+    enemies: jnp.ndarray 
     score: jnp.ndarray
     lives: jnp.ndarray
 
 class SirLancelotInfo(NamedTuple):
     time: jnp.ndarray
+    quick_kills: jnp.ndarray
 
 # -----------------------------------------------------------------------------
 # ENVIRONMENT IMPLEMENTATION
 # -----------------------------------------------------------------------------
 
 class JaxSirLancelot(JaxEnvironment[GameState, SirLancelotObservation, SirLancelotInfo]):
-    """First‑level implementation of *Sir Lancelot* (Atari 2600, 1983).
 
-    Only the exterior castle screen with flying snakes is implemented.  The
-    player rides Pegasus, flapping to stay aloft, and must defeat all snakes
-    with a jousting mechanic: on collision the higher combatant wins; equal
-    heights or both facing away == bounce (no kill).
-    """
-
-    def __init__(self, max_enemies: int = 4):
+    def __init__(self, max_enemies: int = 4): 
         super().__init__()
         self.cfg = GameConfig()
         self.max_enemies = max_enemies
-        self.state = self.reset()[1]  # store so render() outside env can use
 
-    # ------------------------------------------------------------------ RESET
+    def _spawn_single_enemy(self, key: jax.random.PRNGKey, enemy_idx_dummy: int, cfg_tuple: GameConfig):
+        key_y, key_offset = jax.random.split(key, 2)
+
+        enemy_spawn_y_positions_arr = jnp.asarray(cfg_tuple.enemy_spawn_y_positions, dtype=jnp.float32)
+        # guarantee each enemy slot i gets a distinct preset height
+        spawn_y = enemy_spawn_y_positions_arr[ enemy_idx_dummy % enemy_spawn_y_positions_arr.shape[0] ]
+
+        x_offset = cfg_tuple.enemy_spawn_x_buffer + jax.random.uniform(key_offset, minval=0, maxval=10)
+        spawn_x = cfg_tuple.screen_width + x_offset  # always start off‑screen right
+        direction = -1                               # always fly left
+
+        return jnp.array([spawn_x, spawn_y], dtype=jnp.float32), jnp.array(direction, dtype=jnp.int32)
+
+
     def reset(self, key: jax.random.PRNGKey = None):
-        cfg = self.cfg
+        cfg = self.cfg 
+        if key is None: key = jax.random.PRNGKey(0)
+        
+        key_player, key_enemies_master, key_state_global = jax.random.split(key, 3)
+
         player = PlayerState(
             x=jnp.array(cfg.player_start_x, dtype=jnp.float32),
             y=jnp.array(cfg.player_start_y, dtype=jnp.float32),
-            vel_y=jnp.array(0.0),
-            facing_left=jnp.array(False),
-            flap_cooldown=jnp.array(0),
+            vel_x=jnp.array(0.0, dtype=jnp.float32),
+            vel_y=jnp.array(0.0, dtype=jnp.float32),
+            facing_left=jnp.array(False), 
+            flap_cooldown=jnp.array(0, dtype=jnp.int32),
+            is_flapping_sprite=jnp.array(False),
+            flap_animation_timer=jnp.array(0, dtype=jnp.int32),
+            is_dead_falling=jnp.array(False),
+            death_cooldown=jnp.array(0, dtype=jnp.int32),
+            is_grounded=jnp.array(False) # Initialize is_grounded
         )
+        
+        keys_enemies_spawn = jax.random.split(key_enemies_master, self.max_enemies)
+        dummy_indices = jnp.arange(self.max_enemies)
 
-        # Spawn snakes alternating left/right
-        positions = []
-        directions = []
-        for i, y in enumerate(cfg.enemy_spawn_y_positions[: self.max_enemies]):
-            if i % 2 == 0:
-                positions.append([cfg.enemy_spawn_x_left, y])
-                directions.append(1)  # fly right
-            else:
-                positions.append([cfg.enemy_spawn_x_right, y])
-                directions.append(-1)  # fly left
-        positions = jnp.array(positions, dtype=jnp.float32)
-        directions = jnp.array(directions, dtype=jnp.int32)
-        active = jnp.ones((self.max_enemies,), dtype=bool)
-        animation_counter = jnp.zeros((self.max_enemies,), dtype=jnp.int32)
-
+        all_positions, all_directions = jax.vmap(self._spawn_single_enemy, in_axes=(0, 0, None))(
+            keys_enemies_spawn, dummy_indices, self.cfg
+        )
+        
         enemies = EnemyState(
-            positions=positions,
-            directions=directions,
-            active=active,
-            animation_counter=animation_counter,
+            positions=all_positions, 
+            directions=all_directions,
+            active=jnp.ones((self.max_enemies,), dtype=bool), 
+            animation_counter=jnp.zeros((self.max_enemies,), dtype=jnp.int32),
+            respawn_cooldown=jnp.zeros((self.max_enemies,), dtype=jnp.int32)
         )
 
         state = GameState(
-            player=player,
-            enemies=enemies,
-            score=jnp.array(0),
-            lives=jnp.array(cfg.initial_lives),
-            time=jnp.array(0),
+            player=player, enemies=enemies, score=jnp.array(0, dtype=jnp.int32),
+            lives=jnp.array(cfg.initial_lives, dtype=jnp.int32), time=jnp.array(0, dtype=jnp.int32),
             game_over=jnp.array(False),
+            last_kill_time=jnp.array(-cfg.quick_kill_time_limit -1, dtype=jnp.int32), 
+            kills_in_quick_succession=jnp.array(0, dtype=jnp.int32),
+            key = key_state_global
         )
         return self._get_observation(state), state
 
-    # ------------------------------------------------------------------ STEP
     @partial(jax.jit, static_argnums=(0,))
     def step(self, state: GameState, action: int):
         cfg = self.cfg
+        key, key_player_respawn, key_enemy_respawn_master = jax.random.split(state.key, 3)
+        
+        current_player_state = state.player
 
-        # --------------------------- Handle player input
-        # Horizontal movement (no acceleration for simplicity)
-        dx = jnp.where(
-            jnp.any(jnp.array([action == Action.LEFT, action == Action.UPLEFT, action == Action.DOWNLEFT])),
-            -cfg.max_speed_x,
-            jnp.where(
-                jnp.any(jnp.array([action == Action.RIGHT, action == Action.UPRIGHT, action == Action.DOWNRIGHT])),
-                cfg.max_speed_x,
-                0,
-            ),
-        )
+        def update_alive_player_physics(p_state, act): 
+            move_left_input = jnp.any(jnp.array([act == Action.LEFT, act == Action.UPLEFT, act == Action.DOWNLEFT, act == Action.LEFTFIRE, act == Action.UPLEFTFIRE, act == Action.DOWNLEFTFIRE]))
+            move_right_input = jnp.any(jnp.array([act == Action.RIGHT, act == Action.UPRIGHT, act == Action.DOWNRIGHT, act == Action.RIGHTFIRE, act == Action.UPRIGHTFIRE, act == Action.DOWNRIGHTFIRE]))
 
-        # Flap (FIRE) – impulse upward if cooldown reached zero
-        fire_pressed = jnp.any(
-            jnp.array([
-                action == Action.FIRE,
-                action == Action.UPFIRE,
-                action == Action.DOWNFIRE,
-                action == Action.LEFTFIRE,
-                action == Action.RIGHTFIRE,
-            ])
-        )
-        can_flap = state.player.flap_cooldown == 0
-        vel_y = state.player.vel_y + cfg.gravity  # gravity each frame
-        vel_y = jnp.clip(vel_y, -999, cfg.max_fall_speed)
-        # apply flap impulse
-        vel_y = jax.lax.cond(
-            fire_pressed & can_flap,
-            lambda vy: vy + cfg.flap_impulse,
-            lambda vy: vy,
-            vel_y,
-        )
-        new_cooldown = jax.lax.cond(
-            fire_pressed & can_flap,
-            lambda _: jnp.array(5),  # 5‑frame cooldown between flaps
-            lambda _: jnp.maximum(state.player.flap_cooldown - 1, 0),
-            operand=None,
-        )
-
-        new_x = jnp.clip(state.player.x + dx, 0, cfg.screen_width - cfg.player_width)
-        new_y = jnp.clip(state.player.y + vel_y, 0, cfg.screen_height - cfg.player_height - 20)  # leave space for HUD
-
-        facing_left = jax.lax.cond(dx < 0, lambda: True, lambda: jax.lax.cond(dx > 0, lambda: False, lambda: state.player.facing_left))
-
-        player = PlayerState(
-            x=new_x,
-            y=new_y,
-            vel_y=vel_y,
-            facing_left=facing_left,
-            flap_cooldown=new_cooldown,
-        )
-
-        # --------------------------- Update enemies
-        def update_enemy(i, tup):
-            pos, dir_, active, anim_counter = tup
-
-            # Move only if active
-            new_x = jnp.where(active, pos[0] + dir_ * cfg.enemy_speed, pos[0])
-            # wrap around horizontally outside screen, keep same dir
-            off_left = new_x > cfg.screen_width + 10
-            off_right = new_x < -10
-            still_active = jnp.where(off_left | off_right, False, active)
-            # update animation counter (toggle 0/1 every 8 frames)
-            new_anim = (anim_counter + 1) % 16
-            return (jnp.array([new_x, pos[1]]), dir_, still_active, new_anim)
-
-        positions, directions, actives, anims = state.enemies
-        positions_out, directions_out, actives_out, anims_out = jax.lax.fori_loop(
-            0, self.max_enemies, lambda i, carry: (*[x.at[i].set(y) for x, y in zip(carry, update_enemy(i, (positions[i], directions[i], actives[i], anims[i])))],), (positions, directions, actives, anims)
-        )
-        # The above trick isn’t nice – easier: build lists then stack.
-        # Simpler: use vmap
-
-        # --- update all enemies in one vmap pass ---
-        def move_enemy(pos, dir_, active, anim):
-            new_x = jnp.where(active, pos[0] + dir_ * cfg.enemy_speed, pos[0])
-            off_screen = (new_x < -10) | (new_x > cfg.screen_width + 10)
-            new_active = jnp.where(off_screen, False, active)
-            new_anim   = (anim + 1) % 16
-            return jnp.array([new_x, pos[1]]), dir_, new_active, new_anim
-
-        positions_out, directions_out, actives_out, anims_out = jax.vmap(move_enemy)(
-            state.enemies.positions,
-            state.enemies.directions,
-            state.enemies.active,
-            state.enemies.animation_counter,
-        )
-
-        enemies = EnemyState(
-            positions=positions_out,
-            directions=directions_out,
-            active=actives_out,
-            animation_counter=anims_out,
-        )
-
-        # --------------------------- Collision detection
-        def collide_single(enemy_pos, enemy_active):
-            collides = enemy_active & (
-                (player.x < enemy_pos[0] + cfg.enemy_width) &
-                (player.x + cfg.player_width > enemy_pos[0]) &
-                (player.y < enemy_pos[1] + cfg.enemy_height) &
-                (player.y + cfg.player_height > enemy_pos[1])
+            target_vel_x = 0.0
+            target_vel_x = jnp.where(move_left_input, -cfg.max_speed_x, target_vel_x)
+            target_vel_x = jnp.where(move_right_input, cfg.max_speed_x, target_vel_x)
+            
+            new_facing_left = jax.lax.cond(
+                move_left_input, 
+                lambda _: True, 
+                lambda _: jax.lax.cond(
+                    move_right_input, 
+                    lambda __: False, 
+                    lambda __: p_state.facing_left, 
+                    None 
+                ), 
+                None 
             )
-            return collides
+            
+            # Grounded check (player's feet are at the bottom of play area)
+            # A small tolerance (e.g., 1 pixel) might be needed for float precision
+            is_on_ground_check = (p_state.y + cfg.player_height) >= cfg.play_area_bottom_y 
+            
+            # --- Horizontal Movement ---
+            current_vel_x = p_state.vel_x
+            
+            # Determine max speed and deceleration based on grounded state
+            # If grounded, horizontal input might be ignored or heavily dampened unless flapping
+            allow_ground_control = False # Set to True if you want some ground movement, False for Joust-like stop
+            
+            effective_max_speed_x = jnp.where(is_on_ground_check & ~allow_ground_control, 0.0, cfg.max_speed_x) # No speed on ground if not allowed
+            effective_deceleration = jnp.where(is_on_ground_check, cfg.ground_friction_deceleration, cfg.horizontal_deceleration)
+            
+            effective_target_vel_x = 0.0
+            effective_target_vel_x = jnp.where(move_left_input, -effective_max_speed_x, effective_target_vel_x)
+            effective_target_vel_x = jnp.where(move_right_input, effective_max_speed_x, effective_target_vel_x)
 
-        collision_mask = jax.vmap(collide_single)(enemies.positions, enemies.active)
-        any_collision = jnp.any(collision_mask)
+            is_reversing = (move_left_input & (current_vel_x > 0.01)) | (move_right_input & (current_vel_x < -0.01))
+            
+            new_vel_x = current_vel_x
+            new_vel_x = jnp.where(is_reversing, 0.0, new_vel_x) 
+            
+            # Apply acceleration or deceleration
+            # If grounded and no ground control, target is 0, so it will decelerate via friction
+            new_vel_x = jnp.where(effective_target_vel_x != 0.0,
+                                  jnp.clip(new_vel_x + jnp.sign(effective_target_vel_x) * cfg.horizontal_acceleration, -effective_max_speed_x, effective_max_speed_x),
+                                  new_vel_x * (1.0 - effective_deceleration)
+                                 )
+            # If grounded and not flapping, force vel_x towards 0 more aggressively
+            new_vel_x = jnp.where(is_on_ground_check & (p_state.flap_cooldown > 0), new_vel_x * (1.0 - cfg.ground_friction_deceleration * 2.0), new_vel_x)
 
-        # Determine outcome per collision rules
-        def resolve_collision(enemy_idx, vals):
-            pos = enemies.positions[enemy_idx]
-            active = enemies.active[enemy_idx]
-            higher_player = player.y < pos[1]  # lower `y` is higher on screen
-            player_wins = higher_player  # simplified rule: higher wins
-            # update active flag
-            new_active = jnp.where(active & collision_mask[enemy_idx] & player_wins, False, active)
-            score_add = jnp.where(active & collision_mask[enemy_idx] & player_wins, cfg.points_per_enemy, 0)
-            player_loses = (~player_wins) & active & collision_mask[enemy_idx]
-            life_loss = jnp.where(player_loses, 1, 0)
-            return new_active, score_add, life_loss
 
-        def loop_body(i, carry):
-            actives_arr, sc, life_loss_acc = carry
-            new_active_i, score_add_i, life_loss_i = resolve_collision(i, None)
-            actives_arr = actives_arr.at[i].set(new_active_i)
-            return actives_arr, sc + score_add_i, life_loss_acc + life_loss_i
+            # --- Vertical Movement (Flapping & Gravity) ---
+            fire_pressed = jnp.any(jnp.array([act == Action.FIRE, act == Action.UPFIRE, act == Action.DOWNFIRE, act == Action.LEFTFIRE, act == Action.RIGHTFIRE, act == Action.UPLEFTFIRE, act == Action.UPRIGHTFIRE, act == Action.DOWNLEFTFIRE, act == Action.DOWNRIGHTFIRE]))
+            can_flap = p_state.flap_cooldown == 0
+            is_flapping_now = fire_pressed & can_flap
 
-        actives_after, score_gained, lives_lost = jax.lax.fori_loop(0, self.max_enemies, loop_body, (enemies.active, 0, 0))
-        enemies = enemies._replace(active=actives_after)
+            new_vel_y = p_state.vel_y + cfg.gravity
+            new_vel_y = jnp.where(is_flapping_now, cfg.flap_impulse, new_vel_y)
+            new_vel_y = jnp.clip(new_vel_y, cfg.max_climb_speed, cfg.max_fall_speed)
 
-        new_score = state.score + score_gained
-        new_lives = state.lives - lives_lost
+            # If grounded and not trying to flap up, stop vertical velocity
+            new_vel_y = jnp.where(is_on_ground_check & (new_vel_y > 0) & ~is_flapping_now, 0.0, new_vel_y)
 
-        # --------------------------- Check win / loss conditions
-        all_enemies_defeated = jnp.all(~enemies.active)
-        game_over = (new_lives <= 0) | all_enemies_defeated
+
+            new_flap_cooldown = jnp.where(is_flapping_now, cfg.flap_cooldown_duration, jnp.maximum(p_state.flap_cooldown - 1, 0))
+            new_flap_animation_timer = jnp.where(is_flapping_now, cfg.flap_animation_duration, jnp.maximum(0, p_state.flap_animation_timer - 1))
+            
+            raw_player_x = p_state.x + new_vel_x
+            new_player_x = jnp.where(raw_player_x < -cfg.player_width + 1, cfg.screen_width -1, 
+                                 jnp.where(raw_player_x > cfg.screen_width -1, -cfg.player_width + 1, raw_player_x))
+            
+            # Apply vertical movement and clip to play area
+            new_player_y_candidate = p_state.y + new_vel_y
+            new_player_y = jnp.clip(new_player_y_candidate, cfg.play_area_top_y, cfg.play_area_bottom_y - cfg.player_height)
+            
+            # Update is_grounded state
+            new_is_grounded = (new_player_y + cfg.player_height) >= cfg.play_area_bottom_y
+            
+            return p_state._replace(
+                x=new_player_x, y=new_player_y, vel_x=new_vel_x, vel_y=new_vel_y,
+                facing_left=new_facing_left, flap_cooldown=new_flap_cooldown,
+                is_flapping_sprite=new_flap_animation_timer > 0, flap_animation_timer=new_flap_animation_timer,
+                is_grounded=new_is_grounded
+            )
+
+        def update_dead_player_physics(p_state, act_dummy): 
+            new_player_y = p_state.y + cfg.max_fall_speed 
+            new_death_cooldown = jnp.maximum(0, p_state.death_cooldown - 1)
+            return p_state._replace(y=new_player_y, death_cooldown=new_death_cooldown, is_grounded=False) # Not grounded when dead falling
+
+        player_after_movement = jax.lax.cond(
+            current_player_state.is_dead_falling,
+            update_dead_player_physics,
+            update_alive_player_physics,
+            current_player_state, action
+        )
+        
+        player_feet_y = player_after_movement.y + cfg.player_height
+        fell_into_lava = player_feet_y >= cfg.lava_contact_y
+        
+        player_became_dead_this_step = fell_into_lava & ~current_player_state.is_dead_falling
+        player_state_after_env_effects = player_after_movement._replace(
+            is_dead_falling = player_after_movement.is_dead_falling | player_became_dead_this_step,
+            death_cooldown = jnp.where(player_became_dead_this_step, cfg.death_cooldown_frames, player_after_movement.death_cooldown),
+            vel_x = jnp.where(player_became_dead_this_step, 0.0, player_after_movement.vel_x),
+            vel_y = jnp.where(player_became_dead_this_step, 0.0, player_after_movement.vel_y)
+        )
+
+        current_enemies_state = state.enemies
+        def move_single_enemy(idx_move, current_es_state_for_move):
+            pos = current_es_state_for_move.positions[idx_move]
+            dir_ = current_es_state_for_move.directions[idx_move]
+            active = current_es_state_for_move.active[idx_move]
+            anim = current_es_state_for_move.animation_counter[idx_move]
+            cooldown = current_es_state_for_move.respawn_cooldown[idx_move]
+
+            new_cooldown = jnp.maximum(0, cooldown - 1)
+
+            # small deterministic speed variation so they don't stay in formation
+            speed_variation = cfg.enemy_speed * (1.0 + 0.05 * idx_move)
+
+            def _move_active_enemy_logic_closure_fixed(_op):
+                moved_x = pos[0] + dir_ * speed_variation
+
+                wrapped_x = jnp.where(
+                    moved_x < -cfg.enemy_width,
+                    cfg.screen_width + cfg.enemy_width,
+                    jnp.where(
+                        moved_x > cfg.screen_width + cfg.enemy_width,
+                        -cfg.enemy_width,
+                        moved_x,
+                    ),
+                )
+                new_pos = jnp.array([wrapped_x, pos[1]])
+                return new_pos, dir_, (anim + 1) % 16, active, new_cooldown
+
+            def _passthrough_inactive_enemy_fixed(_operand):
+                return pos, dir_, anim, active, new_cooldown
+
+            new_pos, new_dir, new_anim, new_active_flag, new_cooldown_out = jax.lax.cond(
+                active,
+                _move_active_enemy_logic_closure_fixed,
+                _passthrough_inactive_enemy_fixed,
+                None,
+            )
+            return new_pos, new_dir, new_active_flag, new_anim, new_cooldown_out
+
+        def enemy_move_loop_body(i_loop, es_carry_loop):
+            p_loop, d_loop, act_loop, anim_c_loop, rc_loop = move_single_enemy(i_loop, es_carry_loop)
+            return es_carry_loop._replace(
+                positions=es_carry_loop.positions.at[i_loop].set(p_loop),
+                directions=es_carry_loop.directions.at[i_loop].set(d_loop),
+                active=es_carry_loop.active.at[i_loop].set(act_loop),
+                animation_counter=es_carry_loop.animation_counter.at[i_loop].set(anim_c_loop),
+                respawn_cooldown=es_carry_loop.respawn_cooldown.at[i_loop].set(rc_loop)
+            )
+        enemies_after_movement = jax.lax.fori_loop(0, self.max_enemies, enemy_move_loop_body, current_enemies_state)
+
+        def perform_combat_resolution(p_combat_state, e_combat_state, current_score, current_lives, current_lkt, current_kqs):
+            p_rect_l, p_rect_r = p_combat_state.x, p_combat_state.x + cfg.player_width
+            p_rect_t, p_rect_b = p_combat_state.y, p_combat_state.y + cfg.player_height
+
+            e_rect_l, e_rect_r = e_combat_state.positions[:,0], e_combat_state.positions[:,0] + cfg.enemy_width
+            e_rect_t, e_rect_b = e_combat_state.positions[:,1], e_combat_state.positions[:,1] + cfg.enemy_height
+
+            coll_x = (p_rect_l < e_rect_r) & (p_rect_r > e_rect_l)
+            coll_y = (p_rect_t < e_rect_b) & (p_rect_b > e_rect_t)
+            base_coll_mask = e_combat_state.active & coll_x & coll_y
+
+            # sprite image faces LEFT by default; we flip when looking right
+            facing_left_actual = p_combat_state.facing_left
+
+            player_facing_enemy = jnp.where(
+                facing_left_actual,
+                e_combat_state.positions[:, 0] < p_combat_state.x,
+                e_combat_state.positions[:, 0] > p_combat_state.x,
+            )
+
+            enemy_facing_player = jnp.where(
+                e_combat_state.directions == -1,
+                p_combat_state.x < e_combat_state.positions[:, 0],
+                p_combat_state.x > e_combat_state.positions[:, 0],
+            )
+
+            both_facing  = player_facing_enemy & enemy_facing_player
+            player_higher = p_combat_state.y < e_combat_state.positions[:, 1]
+            enemy_higher  = p_combat_state.y > e_combat_state.positions[:, 1]
+
+            player_wins = (player_facing_enemy & ~enemy_facing_player) | (both_facing & player_higher)
+            enemy_wins  = (~player_facing_enemy & enemy_facing_player) | (both_facing & enemy_higher)
+            # if heights equal and both facing, it's a tie → neither wins
+            player_defeats_enemy_conditions = base_coll_mask & player_wins
+            enemy_defeats_player_conditions = base_coll_mask & enemy_wins
+
+            num_player_wins_this_step = jnp.sum(player_defeats_enemy_conditions)
+            num_enemy_wins_this_step = jnp.sum(enemy_defeats_player_conditions)
+
+            new_score_val = current_score
+            new_lkt_val = current_lkt
+            new_kqs_val = current_kqs
+
+            def apply_bonus_for_kills_closure(carry_bonus):
+                s_bonus, lkt_bonus, kqs_bonus = carry_bonus
+                time_now = state.time
+                time_since_last = time_now - lkt_bonus
+                is_quick = time_since_last <= cfg.quick_kill_time_limit
+
+                kqs_for_bonus_calc = jnp.where(is_quick, kqs_bonus, 0)
+                bonus_idx = jnp.minimum(kqs_for_bonus_calc, 2)
+                bonus_val = jax.lax.switch(bonus_idx, [
+                    lambda: jnp.array(cfg.quick_kill_bonus_1, dtype=jnp.int32),
+                    lambda: jnp.array(cfg.quick_kill_bonus_2, dtype=jnp.int32),
+                    lambda: jnp.array(cfg.quick_kill_bonus_3, dtype=jnp.int32)
+                ])
+                score_update = (cfg.points_per_enemy * num_player_wins_this_step) + bonus_val
+                return s_bonus + score_update, time_now, kqs_for_bonus_calc + num_player_wins_this_step
+
+            new_score_val, new_lkt_val, new_kqs_val = jax.lax.cond(
+                num_player_wins_this_step > 0,
+                apply_bonus_for_kills_closure,
+                lambda carry_passthrough: carry_passthrough,
+                (new_score_val, new_lkt_val, new_kqs_val)
+            )
+
+            updated_enemy_active = e_combat_state.active & ~player_defeats_enemy_conditions
+            player_hit_in_combat = num_enemy_wins_this_step > 0
+
+            final_p_state = p_combat_state._replace(
+                is_dead_falling=p_combat_state.is_dead_falling | player_hit_in_combat,
+                death_cooldown=jnp.where(player_hit_in_combat, cfg.death_cooldown_frames, p_combat_state.death_cooldown),
+                vel_x=jnp.where(player_hit_in_combat, 0.0, p_combat_state.vel_x),
+                vel_y=jnp.where(player_hit_in_combat, 0.0, p_combat_state.vel_y)
+            )
+            final_e_state = e_combat_state._replace(active=updated_enemy_active)
+            final_lives = current_lives - jnp.where(player_hit_in_combat, 1, 0)
+
+            return final_p_state, final_e_state, new_score_val, final_lives, new_lkt_val, new_kqs_val
+
+        player_after_combat, enemies_after_combat, score_after_combat, lives_after_combat, lkt_after_combat, kqs_after_combat = jax.lax.cond(
+            ~player_state_after_env_effects.is_dead_falling,
+            lambda: perform_combat_resolution(player_state_after_env_effects, enemies_after_movement, state.score, state.lives, state.last_kill_time, state.kills_in_quick_succession),
+            lambda: (player_state_after_env_effects, enemies_after_movement, state.score, state.lives, state.last_kill_time, state.kills_in_quick_succession)
+        )
+        
+        keys_enemy_respawn = jax.random.split(key_enemy_respawn_master, self.max_enemies)
+        current_e_state_for_respawn = enemies_after_combat
+        defeated_this_step_mask = enemies_after_movement.active & ~enemies_after_combat.active
+        
+        def respawn_loop_body(i_respawn, es_respawn_carry):
+            current_cooldown = es_respawn_carry.respawn_cooldown[i_respawn]
+            is_defeated_now = defeated_this_step_mask[i_respawn]
+            
+            cooldown_after_defeat = jnp.where(is_defeated_now, cfg.enemy_respawn_delay_frames, current_cooldown)
+            
+            can_respawn_slot = (~es_respawn_carry.active[i_respawn]) & (cooldown_after_defeat == 0)
+            # Level 1: no new snakes once all four are defeated
+            should_respawn_this_enemy = False
+
+            pos_after_spawn, dir_after_spawn = self._spawn_single_enemy(keys_enemy_respawn[i_respawn], i_respawn, self.cfg)
+            
+            new_pos_i = jnp.where(should_respawn_this_enemy, pos_after_spawn, es_respawn_carry.positions[i_respawn])
+            new_dir_i = jnp.where(should_respawn_this_enemy, dir_after_spawn, es_respawn_carry.directions[i_respawn])
+            new_active_i = jnp.where(should_respawn_this_enemy, True, es_respawn_carry.active[i_respawn])
+            new_anim_counter_i = jnp.where(should_respawn_this_enemy, 0, es_respawn_carry.animation_counter[i_respawn])
+
+            return es_respawn_carry._replace(
+                positions=es_respawn_carry.positions.at[i_respawn].set(new_pos_i),
+                directions=es_respawn_carry.directions.at[i_respawn].set(new_dir_i),
+                active=es_respawn_carry.active.at[i_respawn].set(new_active_i),
+                respawn_cooldown=es_respawn_carry.respawn_cooldown.at[i_respawn].set(cooldown_after_defeat),
+                animation_counter=es_respawn_carry.animation_counter.at[i_respawn].set(new_anim_counter_i)
+            )
+        enemies_final_state = jax.lax.fori_loop(0, self.max_enemies, respawn_loop_body, current_e_state_for_respawn)
+        
+        player_death_sequence_complete = player_after_combat.is_dead_falling & (player_after_combat.death_cooldown == 0)
+        final_player_state_for_step = player_after_combat
+        final_game_over_state = state.game_over 
+
+        def handle_player_death_completion_closure(p_state_death, lvs_death):
+            can_respawn_flag = lvs_death >= 0 
+            p_respawned = p_state_death._replace( 
+                x=jnp.array(cfg.player_start_x, dtype=jnp.float32),
+                y=jnp.array(cfg.player_start_y, dtype=jnp.float32),
+                vel_x=0.0, vel_y=0.0, is_dead_falling=False, flap_cooldown=0,
+                facing_left=False, is_flapping_sprite=False, flap_animation_timer=0, death_cooldown=0,
+                is_grounded=False # Reset grounded on respawn
+            )
+            final_p_after_death_seq = jax.lax.cond(can_respawn_flag, lambda _: p_respawned, lambda _: p_state_death, None) 
+            new_go_state_after_death_seq = ~can_respawn_flag 
+            return final_p_after_death_seq, new_go_state_after_death_seq
+
+        final_player_state_for_step, final_game_over_state = jax.lax.cond(
+            player_death_sequence_complete,
+            lambda operand_tuple: handle_player_death_completion_closure(operand_tuple[0], operand_tuple[1]), 
+            lambda operand_tuple: (operand_tuple[0], operand_tuple[2]), 
+            (player_after_combat, lives_after_combat, state.game_over) 
+        )
+
+        # if every enemy is inactive, the player has cleared level 1
+        all_enemies_defeated = jnp.all(~enemies_final_state.active)
+        final_game_over_state = final_game_over_state | all_enemies_defeated
 
         new_state = GameState(
-            player=player,
-            enemies=enemies,
-            score=new_score,
-            lives=new_lives,
-            time=state.time + 1,
-            game_over=game_over,
+            player=final_player_state_for_step, enemies=enemies_final_state, 
+            score=score_after_combat, lives=lives_after_combat,
+            time=state.time + 1, game_over=final_game_over_state,
+            last_kill_time=lkt_after_combat,
+            kills_in_quick_succession=kqs_after_combat,
+            key=key 
         )
 
-        reward = new_score - state.score
+        reward = score_after_combat - state.score 
         done = self._get_done(new_state)
         obs = self._get_observation(new_state)
         info = self._get_info(new_state)
 
         return obs, new_state, reward, done, info
 
-    # ------------------------------------------------------------------ HELPERS
     @partial(jax.jit, static_argnums=(0,))
     def _get_observation(self, state: GameState):
         player_ent = EntityPosition(
-            x=state.player.x,
-            y=state.player.y,
-            width=jnp.array(self.cfg.player_width),
-            height=jnp.array(self.cfg.player_height),
+            x=state.player.x, y=state.player.y,
+            width=jnp.array(self.cfg.player_width, dtype=jnp.float32), 
+            height=jnp.array(self.cfg.player_height, dtype=jnp.float32),
+            facing_left=state.player.facing_left
         )
-        enemy_ents = jnp.concatenate([
-            state.enemies.positions,
-            jnp.full((self.max_enemies, 1), self.cfg.enemy_width),
-            jnp.full((self.max_enemies, 1), self.cfg.enemy_height),
-        ], axis=1)
+        
+        enemy_widths = jnp.full((self.max_enemies,), self.cfg.enemy_width, dtype=jnp.float32)
+        enemy_heights = jnp.full((self.max_enemies,), self.cfg.enemy_height, dtype=jnp.float32)
+        
+        enemy_obs_data = jnp.stack([
+            state.enemies.positions[:,0], state.enemies.positions[:,1],
+            enemy_widths, enemy_heights,
+            state.enemies.active.astype(jnp.float32),
+            state.enemies.directions.astype(jnp.float32) 
+        ], axis=-1) 
+
         return SirLancelotObservation(
-            player=player_ent,
-            enemies=enemy_ents,
-            score=state.score,
-            lives=state.lives,
+            player=player_ent, enemies=enemy_obs_data,
+            score=state.score, lives=state.lives
         )
 
     @partial(jax.jit, static_argnums=(0,))
     def _get_info(self, state: GameState):
-        return SirLancelotInfo(time=state.time)
+        return SirLancelotInfo(time=state.time, quick_kills=state.kills_in_quick_succession)
 
     @partial(jax.jit, static_argnums=(0,))
     def _get_done(self, state: GameState):
@@ -339,223 +550,179 @@ class JaxSirLancelot(JaxEnvironment[GameState, SirLancelotObservation, SirLancel
 
     @partial(jax.jit, static_argnums=(0,))
     def get_action_space(self):
-        return jnp.array([
-            Action.NOOP,
-            Action.LEFT,
-            Action.RIGHT,
-            Action.UP,
-            Action.DOWN,
-            Action.FIRE,  # flap
-            Action.UPLEFT,
-            Action.UPRIGHT,
-            Action.DOWNLEFT,
-            Action.DOWNRIGHT,
-        ])
+        return Action.get_all_values()
 
-# -----------------------------------------------------------------------------
-# RENDERER
-# -----------------------------------------------------------------------------
 
 class SirLancelotRenderer(AtraJaxisRenderer):
-    """Draws current *Sir Lancelot* level 1 state to a 160×210 RGB raster."""
-
     def __init__(self):
         super().__init__()
         self.cfg = GameConfig()
         self.sprites = self._load_sprites()
+        self.max_enemies = 4 
 
-    # ----------------------------------------------------------- sprite loader
-    def _load_sprites(self) -> Dict[str, chex.Array]:
+    def _load_sprites(self) -> Dict[str, Any]: 
         MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
-        sprite_path = os.path.join(MODULE_DIR, "sprites/sir_lancelot/")
+        possible_paths = [
+            os.path.join(MODULE_DIR, "sprites/sir_lancelot/"),
+            os.path.join(MODULE_DIR, "../sprites/sir_lancelot/"),
+            os.path.join(os.getcwd(), "src/jaxatari/games/sprites/sir_lancelot/"),
+            os.path.join(os.getcwd(), "sprites/sir_lancelot/") 
+        ]
+        sprite_path = ""
+        for p_val in possible_paths: 
+            if os.path.exists(os.path.join(p_val, "Background_lvl1.npy")):
+                sprite_path = p_val
+                break
+        if not sprite_path: raise FileNotFoundError(f"Sprite directory for SirLancelot not found in checked paths: {possible_paths}")
+        
+        def load_s(name: str): return aj.loadFrame(os.path.join(sprite_path, name + ".npy")).astype(jnp.uint8)
 
-        def load(name: str):
-            return aj.loadFrame(os.path.join(sprite_path, name + ".npy")).astype(jnp.uint8)
+        sprites: Dict[str, Any] = {}
+        
+        raw_bg = load_s("Background_lvl1") 
+        bg_w, bg_h_raw, bg_c = raw_bg.shape
+        if bg_h_raw > self.cfg.screen_height:
+            cropped_bg = raw_bg[:, :self.cfg.screen_height, :]
+        elif bg_h_raw < self.cfg.screen_height:
+            padding_height = self.cfg.screen_height - bg_h_raw
+            cropped_bg = jnp.pad(raw_bg, ((0,0), (0, padding_height), (0,0)), mode='constant', constant_values=0)
+        else:
+            cropped_bg = raw_bg
+        sprites["background"] = jnp.expand_dims(cropped_bg, 0)
 
-        sprites: Dict[str, chex.Array] = {}
-        sprites["background"] = jnp.expand_dims(load("Background_lvl1"), 0)
-        # --- Player frames ----------------------------------------------------
-        player_neutral = load("SirLancelot_lvl1_neutral")
-        player_fly     = load("SirLancelot_lvl1_fly")
-        player_frames  = aj.pad_to_match([player_neutral, player_fly])
-        sprites["player_neutral"] = jnp.expand_dims(player_frames[0], 0)
-        sprites["player_fly"]     = jnp.expand_dims(player_frames[1], 0)
-        # Beast animation: 2 frames – we’ll repeat each for 8 ticks (v‑similar to Seaquest)
-        beast1 = load("Beast_1_animation_1")
-        beast2 = load("Beast_1_animation_2")
-        beast_frames = aj.pad_to_match([beast1, beast2])
-        sprites["beast"] = jnp.concatenate([
-            jnp.repeat(beast_frames[0][None], 8, axis=0),
-            jnp.repeat(beast_frames[1][None], 8, axis=0),
+        player_frames_list = aj.pad_to_match([load_s("SirLancelot_lvl1_neutral"), load_s("SirLancelot_lvl1_fly")])
+        sprites["player_neutral"] = jnp.expand_dims(player_frames_list[0], 0)
+        sprites["player_fly"] = jnp.expand_dims(player_frames_list[1], 0)
+
+        beast_frames_list = aj.pad_to_match([load_s("Beast_1_animation_1"), load_s("Beast_1_animation_2")])
+        sprites["beast"] = jnp.concatenate([ 
+            jnp.repeat(jnp.expand_dims(beast_frames_list[0],0), 8, axis=0),
+            jnp.repeat(jnp.expand_dims(beast_frames_list[1],0), 8, axis=0),
         ])
-        # --------- DIGITS (0-9) ------------------------------------------
-        digits_list = [load(f"number_{d}") for d in range(10)]
-        # pad_to_match → shape (10, H, W, 4)
-        sprites["digits"] = jnp.asarray(aj.pad_to_match(digits_list))
-        sprites["life_icon"] = jnp.expand_dims(load("Life"), 0)
+
+        digits_list_loaded = [load_s(f"number_{d}") for d in range(10)]
+        padded_digits_list = aj.pad_to_match(digits_list_loaded)
+        sprites["digits"] = jnp.array(padded_digits_list) 
+        
+        life_icon_loaded_list = aj.pad_to_match([load_s("Life")])
+        sprites["life_icon"] = jnp.array(life_icon_loaded_list) 
         return sprites
 
-    # helper inside SirLancelotRenderer.render()
-    def blit(raster, x, y, sprite, *, flip=False):
-        # send (y, x) to atraJaxis
-        return aj.render_at(raster, y, x, sprite, flip_horizontal=flip)
-
-    # ------------------------------------------------------------------ render
     @partial(jax.jit, static_argnums=(0,))
     def render(self, state: GameState):
         raster = jnp.zeros((self.cfg.screen_width, self.cfg.screen_height, 3), dtype=jnp.uint8)
-
-        # Background
-        bg_frame = aj.get_sprite_frame(self.sprites["background"], 0)
+        
+        bg_frame = aj.get_sprite_frame(self.sprites["background"], 0) 
         raster = aj.render_at(raster, 0, 0, bg_frame)
 
-        # Enemies
-        beast_sprite = self.sprites["beast"]
-        def draw_enemy(i, rast):
-            active = state.enemies.active[i]
-            return jax.lax.cond(
-                active,
-                lambda r: aj.render_at(
-                    r,
-                    state.enemies.positions[i, 0].astype(jnp.int32),
-                    state.enemies.positions[i, 1].astype(jnp.int32),
-                    aj.get_sprite_frame(beast_sprite, state.enemies.animation_counter[i]),
-                    flip_horizontal=state.enemies.directions[i] < 0,
-                ),
-                lambda r: r,
-                rast,
+        beast_sprite_sheet = self.sprites["beast"] 
+        def draw_enemy_loop_body(idx, current_raster_enemies): 
+            enemy_active = state.enemies.active[idx]
+            enemy_x = state.enemies.positions[idx, 0].astype(jnp.int32)
+            enemy_y = state.enemies.positions[idx, 1].astype(jnp.int32)
+            flip = state.enemies.directions[idx] == -1 
+            anim_idx = state.enemies.animation_counter[idx]
+            enemy_frame = aj.get_sprite_frame(beast_sprite_sheet, anim_idx) 
+            return jax.lax.cond(enemy_active, lambda r_enemy: aj.render_at(r_enemy, enemy_x, enemy_y, enemy_frame, flip_horizontal=flip), lambda r_enemy: r_enemy, current_raster_enemies)
+        
+        raster = jax.lax.fori_loop(0, self.max_enemies, draw_enemy_loop_body, raster) 
+        
+        def render_player_fn_closure(r_inner_player): 
+            player_sprite_sheet_frames = jax.lax.cond(
+                state.player.is_flapping_sprite, 
+                lambda _: self.sprites["player_fly"], 
+                lambda _: self.sprites["player_neutral"],
+                None 
             )
-        raster = jax.lax.fori_loop(0, state.enemies.positions.shape[0], draw_enemy, raster)
-
-        # Player sprite – choose fly sprite if vel_y < 0 (ascending) else neutral
-        player_sprite = jax.lax.cond(
-            state.player.vel_y < 0,
-            lambda: self.sprites["player_fly"],
-            lambda: self.sprites["player_neutral"],
-        )
-        raster = aj.render_at(
-            raster,
-            state.player.x.astype(jnp.int32),
-            state.player.y.astype(jnp.int32),
-            aj.get_sprite_frame(player_sprite, 0),
-            flip_horizontal=state.player.facing_left,
-        )
-
-        # HUD – Score (bottom centre) & lives (bottom left)
-        digits_sprite = jnp.asarray(self.sprites["digits"])
-        score_digits = aj.int_to_digits(state.score, max_digits=6)  # 6 digits max
-        score_x_start = 80 - (len(score_digits) * 4)  # centre
-        raster = aj.render_label(raster, score_x_start, self.cfg.screen_height - 18, score_digits, digits_sprite, spacing=8)
-
-        # lives
-        life_sprite = aj.get_sprite_frame(self.sprites["life_icon"], 0)
-        def draw_life(i, rast):
-            return jax.lax.cond(
-                i < state.lives,
-                lambda r: aj.render_at(r, 10 + i * (life_sprite.shape[0] + 2), self.cfg.screen_height - 18, life_sprite),
-                lambda r: r,
-                rast,
+            player_frame_to_draw = aj.get_sprite_frame(player_sprite_sheet_frames, 0) 
+            return aj.render_at(
+                r_inner_player,
+                state.player.x.astype(jnp.int32),
+                state.player.y.astype(jnp.int32),
+                player_frame_to_draw,
+                flip_horizontal=jnp.logical_not(state.player.facing_left),  # flip when looking right
             )
-        raster = jax.lax.fori_loop(0, self.cfg.initial_lives, draw_life, raster)
+        
+        should_render_player = ~((state.player.is_dead_falling & (state.player.death_cooldown == 0)) & (state.lives < 0))
+        raster = jax.lax.cond(should_render_player, render_player_fn_closure, lambda r_passthrough_player: r_passthrough_player, raster)
 
-        # Force leftmost 8‑pixel HUD bar to black (Freeway style for RL cropping)
-        raster = raster.at[0:8, :, :].set(0)
+        raster = raster.at[:, 0:self.cfg.top_black_bar_height, :].set(0) 
+
+        # Always show six digits (leading zeros) – all JAX ops, no Python int
+        score_val   = state.score.astype(jnp.int32)
+        place_vals  = jnp.array([100000, 10000, 1000, 100, 10, 1], dtype=jnp.int32)
+        score_digits = jnp.mod(score_val // place_vals, 10)  # shape (6,)
+
+        digit_w      = self.sprites["digits"].shape[1]
+        score_total  = 6 * digit_w + 5                       # five 1-px gaps
+        score_x0     = (self.cfg.screen_width - score_total) // 2
+
+        def _draw_digit(i, rast):
+            x = score_x0 + i * (digit_w + 1)
+            idx = score_digits[i]
+            return aj.render_at(rast, x, self.cfg.hud_y_position, self.sprites["digits"][idx])
+
+        raster = jax.lax.fori_loop(0, 6, _draw_digit, raster)
+
+        life_icon_frame = aj.get_sprite_frame(self.sprites["life_icon"], 0) 
+        life_icon_w = life_icon_frame.shape[0] 
+        def draw_life_loop_body(idx, current_raster_lives_loop): 
+            x_pos = self.cfg.lives_x_start + idx * (life_icon_w + 2) 
+            return jax.lax.cond(idx < state.lives, lambda r_life: aj.render_at(r_life, x_pos, self.cfg.hud_y_position, life_icon_frame), lambda r_life: r_life, current_raster_lives_loop)
+        raster = jax.lax.fori_loop(0, self.cfg.initial_lives, draw_life_loop_body, raster)
+        
         return raster
 
-# -----------------------------------------------------------------------------
-# DEMO LOOP (for manual playtesting)
-# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    import pygame 
 
-def get_human_action() -> chex.Array:
-    keys = pygame.key.get_pressed()
-    left = keys[pygame.K_a] or keys[pygame.K_LEFT]
-    right = keys[pygame.K_d] or keys[pygame.K_RIGHT]
-    up = keys[pygame.K_w] or keys[pygame.K_UP]
-    down = keys[pygame.K_s] or keys[pygame.K_DOWN]
-    fire = keys[pygame.K_SPACE]
-
-    x, y = 0, 0
-    if left and not right:
-        x = -1
-    elif right and not left:
-        x = 1
-    if up and not down:
-        y = 1
-    elif down and not up:
-        y = -1
-
-    # Map to JAX Atari actions (simplified subset)
-    if fire:
-        if x == -1 and y == 1:
-            return jnp.array(Action.UPLEFTFIRE)
-        elif x == 1 and y == 1:
-            return jnp.array(Action.UPRIGHTFIRE)
-        elif x == -1 and y == -1:
-            return jnp.array(Action.DOWNLEFTFIRE)
-        elif x == 1 and y == -1:
-            return jnp.array(Action.DOWNRIGHTFIRE)
-        elif y == 1:
-            return jnp.array(Action.UPFIRE)
-        elif y == -1:
-            return jnp.array(Action.DOWNFIRE)
-        elif x == -1:
-            return jnp.array(Action.LEFTFIRE)
-        elif x == 1:
-            return jnp.array(Action.RIGHTFIRE)
-        else:
-            return jnp.array(Action.FIRE)
-    else:
-        if x == -1 and y == 1:
-            return jnp.array(Action.UPLEFT)
-        elif x == 1 and y == 1:
-            return jnp.array(Action.UPRIGHT)
-        elif x == -1 and y == -1:
-            return jnp.array(Action.DOWNLEFT)
-        elif x == 1 and y == -1:
-            return jnp.array(Action.DOWNRIGHT)
-        elif x == -1:
-            return jnp.array(Action.LEFT)
-        elif x == 1:
-            return jnp.array(Action.RIGHT)
-        elif y == 1:
-            return jnp.array(Action.UP)
-        elif y == -1:
-            return jnp.array(Action.DOWN)
-    return jnp.array(Action.NOOP)
-
-
-def main():
     pygame.init()
-    scaling = 4
+    cfg = GameConfig()
+    scaling = int(3) 
 
     env = JaxSirLancelot()
     renderer = SirLancelotRenderer()
 
-    screen = pygame.display.set_mode((env.cfg.screen_width * scaling, env.cfg.screen_height * scaling))
-    pygame.display.set_caption("Sir Lancelot ‑ Level 1 (JAX Atari)")
-
+    screen = pygame.display.set_mode((cfg.screen_width * scaling, cfg.screen_height * scaling))
+    pygame.display.set_caption("Sir Lancelot - Level 1 (JAX Atari)")
     clock = pygame.time.Clock()
     running = True
-    done = False
+
+    key = jax.random.PRNGKey(0) 
+    obs, state = env.reset(key=key) 
 
     jitted_step = jax.jit(env.step)
     jitted_render = jax.jit(renderer.render)
-    jitted_reset = jax.jit(env.reset)
 
-    obs, state = jitted_reset()
-
-    while running and not done:
+    while running:
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
+            if event.type == pygame.QUIT: running = False
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                key, reset_key_sub = jax.random.split(state.key) 
+                obs, state = env.reset(key=reset_key_sub)
+                print("Game Reset!")
+        
+        pressed_pygame_keys = pygame.key.get_pressed()
+        current_action = Action.NOOP 
+        if pressed_pygame_keys[pygame.K_LEFT]: current_action = Action.LEFT
+        elif pressed_pygame_keys[pygame.K_RIGHT]: current_action = Action.RIGHT
+        if pressed_pygame_keys[pygame.K_SPACE]: 
+            if current_action == Action.LEFT: current_action = Action.LEFTFIRE
+            elif current_action == Action.RIGHT: current_action = Action.RIGHTFIRE
+            else: current_action = Action.FIRE
+        
+        obs, state, reward, done, info = jitted_step(state, jnp.array(current_action, dtype=jnp.int32))
 
-        action = get_human_action()
-        obs, state, reward, done, info = jitted_step(state, action)
-        raster = jitted_render(state)
-        aj.update_pygame(screen, raster, scaling, env.cfg.screen_width, env.cfg.screen_height)
-        clock.tick(60)
+        if reward != 0: print(f"Score: {state.score}, Reward: {reward}, Lives: {state.lives}") 
+        if done:
+            print(f"Game Over! Final Score: {state.score}, Time: {state.time}, Quick Kills: {info.quick_kills}")
+            key, reset_key_sub_done = jax.random.split(state.key)
+            obs, state = env.reset(key=reset_key_sub_done)
+
+        raster_frame = jitted_render(state) 
+        aj.update_pygame(screen, raster_frame, scaling, cfg.screen_width, cfg.screen_height)
+        
+        pygame.display.flip()
+        clock.tick(60) 
 
     pygame.quit()
-
-if __name__ == "__main__":
-    main()

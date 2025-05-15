@@ -1,3 +1,9 @@
+# -----------------------------------------------------------------------------
+# TEAM
+# Adrian Muslija, 2541907
+# Florent Muslija, 2527727
+# -----------------------------------------------------------------------------
+
 import os
 from functools import partial
 from typing import NamedTuple, Tuple, List, Dict, Any, Optional
